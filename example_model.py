@@ -5,80 +5,81 @@ Example classifier on Numerai data using a logistic regression classifier.
 To get started, install the required packages: pip install pandas, numpy, sklearn
 """
 
-import pandas as pd
 import numpy as np
-from sklearn import metrics, preprocessing, linear_model
-from sklearn.model_selection import train_test_split as tts
-from sklearn.linear_model import SGDClassifier as SGD
 from sklearn.metrics import log_loss as ll
-from sklearn.grid_search import GridSearchCV as GS
-from sklearn.metrics import make_scorer as MS
+from pyspark import SparkContext
+from pyspark.ml import Pipeline
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.ml.feature import VectorAssembler
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf
+from pyspark.sql.types import DoubleType
 
 
 def main():
     # Set seed for reproducibility
-    np.random.seed(0)
+    np.random.seed(1)
 
-    print("Loading data...")
+    # Create SparkContext
+    spark = SparkSession.builder.appName('Numerai Model').getOrCreate()
+
     # Load the data from the CSV files
-    training_data = pd.read_csv('numerai_training_data.csv', header=0)
-    prediction_data = pd.read_csv('numerai_tournament_data.csv', header=0)
+    print('Loading data...')
+    training_data   = spark.read.csv('numerai_training_data.csv',   header=True, inferSchema=True)
+    tournament_data = spark.read.csv('numerai_tournament_data.csv', header=True, inferSchema=True)
+    validation_data = tournament_data.where('data_type = "validation"')
+    prediction_data = tournament_data.where('data_type = "test"')
+    print("Finished loading data...")
 
-    # Transform the loaded CSV data into numpy arrays
-    Y = training_data['target']
-    X = training_data.drop('target', axis=1)
-    t_id = prediction_data['t_id']
-    x_prediction = prediction_data.drop('t_id', axis=1)
 
-    x_train, x_test, y_train, y_test = tts(X,Y, test_size=0.15, random_state=0)
-    
-    parameters = {
-        "loss": ["log", "modified_huber"],
-        "penalty": ["none", "l2", "l1", "elasticnet"],
-        "alpha": [0.0001, 0.0003, 0.0009, 0.00003, 0.00001],
-        "fit_intercept": [True, False],
-        "n_iter": [5, 10],
-        "verbose":[1]
-    }
+    # Create a LogisticRegression instance. This instance is an Estimator.
+    featureCols = [col for col in training_data.columns if col.startswith("feature")]
+    featureAssembler = VectorAssembler(inputCols=featureCols, outputCol="features")
+    lr = LogisticRegression(labelCol="target")
+    pipeline = Pipeline(stages=[featureAssembler, lr])
 
-    best_params = {
-       'alpha':[0.0002, 0.0003, 0.0004], 'average':[False, True], 'class_weight':[None, 'balanced'], 'epsilon':[0.1, 0.3, 0.9, 0.03, 0.01],
-       'eta0':[0.0], 'fit_intercept':[False], 'l1_ratio':[0.15, 0.3, 0.45],
-       'learning_rate':['optimal'], 'loss':['log'], 'n_iter':[5], 'n_jobs':[4],
-       'penalty':['l1'], 'power_t':[0.5], 'random_state':[None], 'shuffle':[True],
-       'verbose':[1], 'warm_start':[False]
-    }
+    # We now treat the Pipeline as an Estimator, wrapping it in a CrossValidator instance.
+    # This will allow us to jointly choose parameters for all Pipeline stages.
+    # A CrossValidator requires an Estimator, a set of Estimator ParamMaps, and an Evaluator.
+    # We use a ParamGridBuilder to construct a grid of parameters to search over.
+    paramGrid = ParamGridBuilder() \
+        .addGrid(lr.maxIter, [3, 5, 10]) \
+        .addGrid(lr.regParam, [0.2, 0.1, 0.05, 0.01]) \
+        .addGrid(lr.elasticNetParam, [0, 0.5, 1]) \
+        .addGrid(lr.aggregationDepth, [2, 3]) \
+        .build()
 
-    # This is your model that will learn to predict
-    scorer = MS(ll, greater_is_better=False, needs_proba=True, needs_threshold=False)
+    crossval = CrossValidator(estimator=pipeline,
+                              estimatorParamMaps=paramGrid,
+                              evaluator=BinaryClassificationEvaluator(labelCol="target"),
+                              numFolds=10)
 
-    grid_obj = GS(SGD(), best_params, scoring=scorer)
-
+    # Run cross-validation, and choose the best set of parameters.
     print("Training....")
-    # Your model is trained on the numerai_training_data
-    grid_fit = grid_obj.fit(x_train, y_train)
-    best_model = grid_fit.best_estimator_
-    print(best_model)
+    cvModel = crossval.fit(training_data)
 
-    best_model.fit(x_train, y_train)
-    y_predict = best_model.predict_log_proba(x_test)
-    print(y_predict.shape)
-    print(y_test.shape)
-    print("Score", ll(y_test, y_predict))
-
-    print("Predicting...")
-    # Your trained model is now used to make predictions on the numerai_tournament_data
+    # The trained model will now make predictions on the numerai_tournament_data
     # The model returns two columns: [probability of 0, probability of 1]
     # We are just interested in the probability that the target is 1.
-    y_prediction = best_model.predict_proba(x_prediction)
-    results = y_prediction[:, 1]
-    results_df = pd.DataFrame(data={'probability':results})
-    joined = pd.DataFrame(t_id).join(results_df)
+    prob1 = udf(lambda probs: float(probs[1]))
 
+    # Print training summary.
+    validation_predictions = cvModel.transform(validation_data)
+    validation_target_array = validation_predictions.select("target").rdd.map(lambda x: float(x[0])).collect()
+    validation_prediction_array = validation_predictions.select(prob1("probability")).rdd.map(lambda x: float(x[0])).collect()
+    print "Validation Score (LogLoss):", ll(validation_target_array, validation_prediction_array)
+
+    # Make predictions.
+    print("Predicting...")
+    prediction = cvModel.transform(prediction_data)
+
+    # Write predictions.
     print("Writing predictions to predictions.csv")
-    # Save the predictions out to a CSV file
-    joined.to_csv("predictions.csv", index=False)
-    # Now you can upload these predictions on numer.ai
+    filteredPredictions = prediction.select("id", prob1("probability").alias("probability")) \
+                                    .toPandas()
+    filteredPredictions.to_csv("predictions.csv", index=False)
 
 
 if __name__ == '__main__':
